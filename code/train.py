@@ -1,4 +1,4 @@
-"""train.py — PSEUDO-CODE. Bạn phải tự hoàn thiện mọi hàm có `raise NotImplementedError`.
+"""Pipeline huấn luyện, đánh giá và xuất dự đoán.
 
 Gồm: đặt seed, đánh giá, vòng huấn luyện `run_experiment(cfg, data)`, dự đoán và ghi file nộp.
 Mọi thí nghiệm chỉ là *đổi dict cfg* rồi gọi lại run_experiment (xem GUIDE, Part 2).
@@ -8,6 +8,9 @@ Mọi chỉ số (loss, accuracy, macro-F1) dùng cùng định nghĩa với scr
 from __future__ import annotations
 
 import time
+import copy, random
+from contextlib import nullcontext
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -34,7 +37,8 @@ DEFAULT_CFG = dict(
 
 def set_seed(seed: int) -> None:
     """Đặt seed cho random, numpy, torch (và torch.cuda nếu có)."""
-    raise NotImplementedError  # TODO
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
 
 def macro_f1_from_confusion(cm: np.ndarray) -> float:
@@ -42,7 +46,10 @@ def macro_f1_from_confusion(cm: np.ndarray) -> float:
 
     cm: ma trận nhầm lẫn (7, 7), hàng = nhãn thật, cột = dự đoán.
     """
-    raise NotImplementedError  # TODO
+    cm=np.asarray(cm,dtype=float); tp=np.diag(cm)
+    p=np.divide(tp,cm.sum(0),out=np.zeros_like(tp),where=cm.sum(0)>0)
+    r=np.divide(tp,cm.sum(1),out=np.zeros_like(tp),where=cm.sum(1)>0)
+    return float(np.divide(2*p*r,p+r,out=np.zeros_like(tp),where=p+r>0).mean())
 
 
 @torch.no_grad()
@@ -51,7 +58,8 @@ def predict(model, X, batch_size: int = 8192) -> torch.Tensor:
 
     Các bước: model.eval(); duyệt X theo từng lô (không cần xáo); gom argmax(dim=1); torch.cat.
     """
-    raise NotImplementedError  # TODO
+    model.eval()
+    return torch.cat([model(X[i:i+batch_size]).argmax(1) for i in range(0,len(X),batch_size)])
 
 
 @torch.no_grad()
@@ -65,14 +73,24 @@ def evaluate(model, X, y, loss_name: str = "ce", batch_size: int = 8192) -> dict
       4. dựng ma trận nhầm lẫn 7x7 -> macro_f1_from_confusion
     Dùng hàm này cho: train loss (trên toàn bộ hoặc một tập con CỐ ĐỊNH của train), val, và eval cuối cùng.
     """
-    raise NotImplementedError  # TODO
+    model.eval(); total=0.; preds=[]
+    for i in range(0,len(X),batch_size):
+        xb,yb=X[i:i+batch_size],y[i:i+batch_size]; z=model(xb)
+        if loss_name=="ce": loss=F.cross_entropy(z,yb,reduction="sum")
+        elif loss_name=="mse": loss=F.mse_loss(z,F.one_hot(yb,7).to(z.dtype),reduction="sum")/7
+        else: raise ValueError(loss_name)
+        total+=loss.item(); preds.append(z.argmax(1))
+    pred=torch.cat(preds); cm=torch.bincount(y.long()*7+pred.long(),minlength=49).reshape(7,7)
+    return {"loss":total/len(y),"acc":float((pred==y).float().mean()),"macro_f1":macro_f1_from_confusion(cm.cpu().numpy())}
 
 
 def compute_loss(logits, y, loss_name: str):
     """"ce"  : cross-entropy nhận logit thô và nhãn int64 (F.cross_entropy).
        "mse" : MSE giữa logit và one-hot của y (ghi rõ bạn lấy trung bình thế nào).
     """
-    raise NotImplementedError  # TODO
+    if loss_name=="ce": return F.cross_entropy(logits,y)
+    if loss_name=="mse": return F.mse_loss(logits,F.one_hot(y,7).to(logits.dtype))
+    raise ValueError(loss_name)
 
 
 def run_experiment(cfg: dict, data: dict) -> dict:
@@ -114,7 +132,50 @@ def run_experiment(cfg: dict, data: dict) -> dict:
       3. tổng hợp summary tại best_epoch (val_acc, val_macro_f1 lấy ở best_epoch); peak_mem_MB nếu có GPU
     TUYỆT ĐỐI không đưa X_eval vào hàm này để chọn epoch/cấu hình. Chỉ dùng val.
     """
-    raise NotImplementedError  # TODO
+    cfg={**DEFAULT_CFG,**cfg}
+    if cfg["lr"] is None: raise ValueError("select lr on validation")
+    set_seed(cfg["seed"]); device=data["X_tr"].device; hidden=tuple(cfg["hidden"])
+    model=MLP(hidden,cfg["dropout"],cfg["init"]).to(device)
+    if hidden in EXPECTED_PARAMS: assert count_params(model)==EXPECTED_PARAMS[hidden]
+    opt=build_optimizer(cfg["optimizer"],model.parameters(),cfg["lr"],cfg["weight_decay"],cfg["momentum"])
+    precision=cfg["precision"]
+    if precision=="fp16" and device.type!="cuda": raise ValueError("fp16 requires CUDA")
+    dtype=torch.float16 if precision=="fp16" else torch.bfloat16
+    scaler=torch.amp.GradScaler("cuda",enabled=precision=="fp16")
+    if device.type=="cuda": torch.cuda.reset_peak_memory_stats()
+    step0=evaluate(model,data["X_val"],data["y_val"],cfg["loss"])["loss"]
+    hist={k:[] for k in ("epoch","train_loss","val_loss","val_acc","val_macro_f1","grad_norm","epoch_time_s")}
+    best,best_ep,state,diverged=float("inf"),0,None,False; gen=torch.Generator().manual_seed(cfg["seed"])
+    for ep in range(1,cfg["epochs"]+1):
+        if device.type=="cuda": torch.cuda.synchronize()
+        start=time.perf_counter(); model.train(); norms=[]
+        for xb,yb in iterate_batches(data["X_tr"],data["y_tr"],cfg["batch"],gen):
+            opt.zero_grad(set_to_none=True)
+            ctx=torch.autocast(device_type=device.type,dtype=dtype) if precision!="fp32" else nullcontext()
+            with ctx: loss=compute_loss(model(xb),yb,cfg["loss"])
+            if not torch.isfinite(loss): diverged=True; break
+            scaler.scale(loss).backward()
+            if scaler.is_enabled(): scaler.unscale_(opt)
+            norms.append(clip_gradients(model.parameters(),cfg["clip_norm"]))
+            scaler.step(opt); scaler.update()
+        if device.type=="cuda": torch.cuda.synchronize()
+        elapsed=time.perf_counter()-start
+        if diverged: break
+        tr=evaluate(model,data["X_tr"],data["y_tr"],cfg["loss"]); va=evaluate(model,data["X_val"],data["y_val"],cfg["loss"])
+        vals=(ep,tr["loss"],va["loss"],va["acc"],va["macro_f1"],float(np.mean(norms)),elapsed)
+        for k,v in zip(hist,vals): hist[k].append(v)
+        if va["loss"]<best:
+            best,best_ep=va["loss"],ep; state=copy.deepcopy({k:v.detach().cpu() for k,v in model.state_dict().items()})
+        print(f"[{cfg['exp_id']}] {ep:02d}/{cfg['epochs']} train={tr['loss']:.4f} val={va['loss']:.4f} f1={va['macro_f1']:.4f}")
+    if state is None: state=copy.deepcopy({k:v.detach().cpu() for k,v in model.state_dict().items()})
+    i=best_ep-1 if best_ep else -1; at=lambda k:hist[k][i] if hist[k] else float("nan")
+    summary={"step0_loss":step0,"best_val_loss":best,"best_epoch":best_ep,
+      "final_train_loss":hist["train_loss"][-1] if hist["train_loss"] else float("nan"),
+      "final_val_loss":hist["val_loss"][-1] if hist["val_loss"] else float("nan"),
+      "val_acc":at("val_acc"),"val_macro_f1":at("val_macro_f1"),
+      "time_per_epoch_s":float(np.mean(hist["epoch_time_s"])) if hist["epoch_time_s"] else float("nan"),
+      "peak_mem_MB":float(torch.cuda.max_memory_allocated()/2**20) if device.type=="cuda" else 0.,"diverged":diverged}
+    return {"cfg":cfg,"history":hist,"summary":summary,"best_state":state}
 
 
 def write_predictions(row_id, preds, path: str) -> None:
@@ -124,7 +185,12 @@ def write_predictions(row_id, preds, path: str) -> None:
     preds  : nhãn dự đoán int64 0..6 (cùng thứ tự với row_id)
     Phải đủ mọi dòng của tập eval, mỗi row_id đúng một lần.
     """
-    raise NotImplementedError  # TODO
+    import pandas as pd
+    ids,p=np.asarray(row_id),np.asarray(preds)
+    if ids.ndim!=1 or p.ndim!=1 or len(ids)!=len(p) or len(np.unique(ids))!=len(ids): raise ValueError("invalid predictions")
+    if np.any((p<0)|(p>6)): raise ValueError("pred must be 0..6")
+    out=Path(path); out.parent.mkdir(parents=True,exist_ok=True)
+    pd.DataFrame({"row_id":ids.astype("int64"),"pred":p.astype("int64")}).to_csv(out,index=False)
 
 
 def final_eval(cfg: dict, result: dict, data: dict, pred_path: str) -> None:
@@ -136,4 +202,6 @@ def final_eval(cfg: dict, result: dict, data: dict, pred_path: str) -> None:
       3. write_predictions(data["eval_row_id"], preds.cpu().numpy(), pred_path)
       4. chạy `python scripts/evaluate.py --pred <pred_path>` và ghi kết quả vào bảng/báo cáo
     """
-    raise NotImplementedError  # TODO
+    model=MLP(tuple(cfg["hidden"]),cfg["dropout"],cfg["init"]); model.load_state_dict(result["best_state"])
+    model.to(data["X_eval"].device)
+    write_predictions(data["eval_row_id"],predict(model,data["X_eval"]).cpu().numpy(),pred_path)

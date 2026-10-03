@@ -1,4 +1,4 @@
-"""data.py — PSEUDO-CODE. Bạn phải tự hoàn thiện mọi hàm có `raise NotImplementedError`.
+"""Nạp, chia validation và chuẩn hoá dữ liệu CoverType.
 
 Nhiệm vụ: nạp tập train/eval đã chia sẵn, tách validation từ train, chuẩn hoá, đưa lên thiết bị.
 
@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from pathlib import Path
+from sklearn.model_selection import train_test_split
 
 N_NUMERIC = 10  # số cột liên tục cần chuẩn hoá (cột 0..9)
 
@@ -26,7 +28,13 @@ def load_split(processed_dir: str = "data/processed"):
       2. np.load(f"{processed_dir}/eval.npz")  -> khoá "X", "y", "row_id"
       3. assert shape/dtype đúng quy ước ở đầu file
     """
-    raise NotImplementedError  # TODO
+    root=Path(processed_dir)
+    with np.load(root/"train.npz",allow_pickle=False) as z: Xtr,ytr=z["X"],z["y"]
+    with np.load(root/"eval.npz",allow_pickle=False) as z: Xe,ye,ids=z["X"],z["y"],z["row_id"]
+    for X,y in ((Xtr,ytr),(Xe,ye)):
+        assert X.ndim==2 and X.shape[1]==54 and X.dtype==np.float32
+        assert y.ndim==1 and y.dtype==np.int64 and len(X)==len(y) and y.min()>=0 and y.max()<7
+    return Xtr,ytr,Xe,ye,ids
 
 
 def make_val_split(X, y, val_fraction: float = 0.2, seed: int = 42):
@@ -36,7 +44,7 @@ def make_val_split(X, y, val_fraction: float = 0.2, seed: int = 42):
     Gợi ý: sklearn.model_selection.train_test_split(..., stratify=y, random_state=seed)
     Dùng CÙNG seed và val_fraction cho mọi thí nghiệm để so sánh công bằng.
     """
-    raise NotImplementedError  # TODO
+    return train_test_split(X,y,test_size=val_fraction,random_state=seed,stratify=y)
 
 
 def fit_standardizer(X_tr):
@@ -45,7 +53,9 @@ def fit_standardizer(X_tr):
     Trả về: mean (shape (10,)), std (shape (10,))
     Câu hỏi: vì sao không được tính trên toàn bộ dữ liệu hay trên eval?
     """
-    raise NotImplementedError  # TODO
+    mean=X_tr[:,:N_NUMERIC].mean(0,dtype=np.float64).astype(np.float32)
+    std=X_tr[:,:N_NUMERIC].std(0,dtype=np.float64).astype(np.float32); std[std==0]=1
+    return mean,std
 
 
 def apply_standardizer(X, mean, std):
@@ -53,7 +63,8 @@ def apply_standardizer(X, mean, std):
 
     Chú ý: không sửa X tại chỗ nếu bạn còn dùng lại nó; chú ý std = 0 (nếu có).
     """
-    raise NotImplementedError  # TODO
+    out=np.array(X,dtype=np.float32,copy=True); out[:,:N_NUMERIC]=(out[:,:N_NUMERIC]-mean)/std
+    return out
 
 
 def prepare_data(device: str, val_fraction: float = 0.2, seed: int = 42,
@@ -69,7 +80,17 @@ def prepare_data(device: str, val_fraction: float = 0.2, seed: int = 42,
       3. torch.tensor(..., device=device); X là float32, y là int64
       4. in ra kích thước các tập và accuracy của chiến lược "luôn đoán lớp đa số" trên val
     """
-    raise NotImplementedError  # TODO
+    X,y,Xe,ye,ids=load_split(processed_dir)
+    Xtr,Xv,ytr,yv=make_val_split(X,y,val_fraction,seed)
+    mean,std=fit_standardizer(Xtr)
+    Xtr,Xv,Xe=[apply_standardizer(a,mean,std) for a in (Xtr,Xv,Xe)]
+    d={"X_tr":torch.from_numpy(Xtr).to(device),"y_tr":torch.from_numpy(ytr).to(device),
+       "X_val":torch.from_numpy(Xv).to(device),"y_val":torch.from_numpy(yv).to(device),
+       "X_eval":torch.from_numpy(Xe).to(device),"y_eval":torch.from_numpy(ye).to(device),
+       "eval_row_id":ids,"mean":mean,"std":std}
+    maj=np.bincount(ytr,minlength=7).argmax()
+    print(f"train={Xtr.shape}, val={Xv.shape}, eval={Xe.shape}; majority-val-acc={(yv==maj).mean():.4f}")
+    return d
 
 
 def iterate_batches(X, y, batch_size: int, generator: torch.Generator | None = None, shuffle: bool = True):
@@ -80,4 +101,6 @@ def iterate_batches(X, y, batch_size: int, generator: torch.Generator | None = N
       2. for i in range(0, N, batch_size): idx = perm[i:i+batch_size]; yield X[idx], y[idx]
     Chú ý: batch cuối có thể nhỏ hơn batch_size; hãy quyết định bạn xử lý thế nào và ghi lại.
     """
-    raise NotImplementedError  # TODO
+    idx=torch.randperm(len(X),generator=generator).to(X.device) if shuffle else torch.arange(len(X),device=X.device)
+    for i in range(0,len(X),batch_size):
+        j=idx[i:i+batch_size]; yield X[j],y[j]

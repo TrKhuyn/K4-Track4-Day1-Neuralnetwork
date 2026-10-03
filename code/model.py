@@ -1,4 +1,4 @@
-"""model.py — PSEUDO-CODE. Bạn phải tự hoàn thiện mọi hàm/class có `raise NotImplementedError`.
+"""Định nghĩa MLP và các kiểu khởi tạo cho Lab 1.
 
 Model: MLP cho bài toán 7 lớp, shape cố định (xem README mục 3 và GUIDE, "Quy định kiến trúc"):
 
@@ -41,11 +41,17 @@ class MLP(nn.Module):
         #   2. thêm Linear(h_cuối, num_classes) làm lớp ra
         #   3. gộp bằng nn.Sequential (hoặc tự viết forward), lưu vào self.net
         #   4. gọi init_weights(self, init)
-        raise NotImplementedError
+        if not hidden or any(h<=0 for h in hidden): raise ValueError("invalid hidden")
+        if not 0<=dropout<1: raise ValueError("invalid dropout")
+        layers=[]; width=in_features
+        for h in hidden:
+            layers.extend([nn.Linear(width,h),nn.ReLU(),nn.Dropout(dropout)]); width=h
+        layers.append(nn.Linear(width,num_classes)); self.net=nn.Sequential(*layers)
+        init_weights(self,init)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 54) float32  ->  logits: (B, 7) float32."""
-        raise NotImplementedError  # TODO
+        return self.net(x)
 
 
 def init_weights(model: nn.Module, init: str) -> None:
@@ -59,12 +65,20 @@ def init_weights(model: nn.Module, init: str) -> None:
         "default" : không làm gì (giữ khởi tạo mặc định của nn.Linear; KHÔNG phải He)
     Gợi ý: duyệt model.modules(), chọn isinstance(m, nn.Linear).
     """
-    raise NotImplementedError  # TODO
+    if init not in {"zeros","normal","xavier","he","default"}: raise ValueError(init)
+    if init=="default": return
+    for m in model.modules():
+        if isinstance(m,nn.Linear):
+            if init=="zeros": nn.init.zeros_(m.weight)
+            elif init=="normal": nn.init.normal_(m.weight,0,.01)
+            elif init=="xavier": nn.init.xavier_normal_(m.weight)
+            else: nn.init.kaiming_normal_(m.weight,nonlinearity="relu")
+            nn.init.zeros_(m.bias)
 
 
 def count_params(model: nn.Module) -> int:
     """Tổng số tham số huấn luyện được. Dùng để assert với EXPECTED_PARAMS ngay sau khi tạo model."""
-    raise NotImplementedError  # TODO
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 @torch.no_grad()
@@ -76,4 +90,8 @@ def activation_stats(model: nn.Module, x: torch.Tensor) -> list[float]:
       2. duyệt từng lớp con theo thứ tự; sau mỗi nn.Linear (hoặc sau mỗi ReLU, bạn chọn và ghi rõ) lưu h.std().item()
       3. trả về danh sách std theo lớp
     """
-    raise NotImplementedError  # TODO
+    model.eval(); stats=[]; h=x
+    for layer in model.net:
+        h=layer(h)
+        if isinstance(layer,nn.ReLU): stats.append(float(h.std()))
+    return stats
